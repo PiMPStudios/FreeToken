@@ -424,6 +424,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--experimental-mtp",
+        action="store_true",
+        help="Enable experimental MTP for Qwen4Exp/GLM5Next (single request, greedy).",
+    )
+    parser.add_argument(
+        "--experimental-mtp-tokens",
+        type=_positive_int,
+        default=ServerArgs.experimental_mtp_tokens,
+        help="Draft tokens per Qwen MTP verify (1-8). GLM is fixed at 1. "
+        "FREETOKEN_MTP_K overrides this at runtime.",
+    )
+    parser.add_argument(
         "--decode-log-interval",
         type=_positive_int,
         default=ServerArgs.decode_log_interval,

@@ -131,6 +131,41 @@ def test_hc_merged_gemm_layout_and_top_level_mixer():
     assert torch.allclose(x, ref_x, rtol=1e-5, atol=1e-6)
 
 
+@requires_cuda
+def test_mtp_conditioning_normalizes_all_streams_before_shared_projection():
+    from freetoken.layers import GemmaPlusOneRMSNorm, OPList
+    from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTP
+
+    torch.manual_seed(71)
+    d, streams, eps = 64, 4, 1e-6
+    head = object.__new__(Qwen4ExpMTP)
+    head._hc_count = streams
+    with torch.device("cuda"):
+        head.pre_fc_norm_embedding = GemmaPlusOneRMSNorm(d, eps)
+        head.pre_fc_norm_hidden = GemmaPlusOneRMSNorm(d * streams, eps)
+        head.fc_embedding = LinearReplicated(d, d, has_bias=False)
+        head.fc_hidden = LinearReplicated(d, d, has_bias=False)
+    for tensor in head.state_dict().values():
+        tensor.normal_(0, 0.1)
+    head.layers = OPList([SimpleNamespace(forward=lambda h, batch: h)])
+    head.hyper_connection_mixer = SimpleNamespace(mix=lambda h: (h, None))
+    embedding = torch.randn(3, d, device="cuda")
+    hidden = torch.randn(3, streams, d, device="cuda")
+    hidden *= torch.tensor([1.0, 8.0, 0.1, 40.0], device="cuda")[None, :, None]
+    hidden = hidden.flatten(1)
+    actual = head.forward(hidden, embedding, None)
+    torch.testing.assert_close(head.last_multi, actual)
+
+    def norm(x, weight):
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * (1 + weight)
+
+    h = norm(hidden, head.pre_fc_norm_hidden.weight).unflatten(1, (streams, d))
+    e = F.linear(norm(embedding, head.pre_fc_norm_embedding.weight), head.fc_embedding.weight)
+    expected = torch.stack([F.linear(h[:, i], head.fc_hidden.weight) + e
+                            for i in range(streams)], dim=1).flatten(1)
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+
+
 # --------------------------------------------------------------------------------------
 # PLE
 # --------------------------------------------------------------------------------------

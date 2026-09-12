@@ -208,3 +208,123 @@ def test_chunked_prefill_consistency(rig):
     err = (chunk_logits.float() - full_logits.float()).abs().max().item()
     scale = full_logits.float().abs().max().item() + 1e-8
     assert err / scale < 3e-2, f"chunked/one-shot divergence: {err} (scale {scale})"
+
+
+def test_mtp_masks_only_initial_position_embedding():
+    from freetoken.models.glm5_next.mtp import Glm5NextMTP
+
+    head = object.__new__(Glm5NextMTP)
+    identity = SimpleNamespace(forward=lambda x: x)
+    zero = SimpleNamespace(forward=torch.zeros_like)
+    head.enorm = head.hnorm = head.input_layernorm = head.post_attention_layernorm = identity
+    head.eh_proj = SimpleNamespace(forward=lambda x: x[:, :4])
+    head.self_attn = head.mlp = zero
+    head.shared_head = SimpleNamespace(norm=identity)
+    embedding = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    original = embedding.clone()
+    result = head.forward(torch.ones_like(embedding), embedding,
+                          SimpleNamespace(positions=torch.tensor([0, 1, 7])))
+    torch.testing.assert_close(result[0], torch.zeros(4))
+    torch.testing.assert_close(result[1:], embedding[1:])
+    torch.testing.assert_close(embedding, original)
+
+
+@pytest.mark.parametrize("position", [2, 3])
+def test_speculative_rejection_restores_kda_and_partial_index_groups(rig, position):
+    from freetoken.speculative.mtp import StateSnapshot
+
+    model, ctx = rig
+    prefix = [11, 17, 5][:position]
+    anchor, actual, rejected = 23, 31, 79
+    _reset(ctx)
+    _batch(ctx, prefix, 0, "prefill")
+    model.forward()
+    for offset, token in enumerate([anchor, actual]):
+        _batch(ctx, [token], position + offset, "decode")
+        expected = model.forward()
+    expected_state = ctx.linear_state_pool.recurrent_states.clone()
+    expected_conv = ctx.linear_state_pool.conv_states.clone()
+    expected_tail = ctx.kv_cache._tail_k.clone()
+
+    _reset(ctx)
+    _batch(ctx, prefix, 0, "prefill")
+    model.forward()
+    snapshot = StateSnapshot(ctx)
+    batch = _batch(ctx, [anchor, rejected], position, "prefill")
+    batch.speculative_verify = True
+    model.forward()
+    snapshot.restore()
+    for offset, token in enumerate([anchor, actual]):
+        _batch(ctx, [token], position + offset, "decode")
+        result = model.forward()
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    torch.testing.assert_close(ctx.linear_state_pool.recurrent_states, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(ctx.linear_state_pool.conv_states, expected_conv, rtol=0, atol=0)
+    torch.testing.assert_close(ctx.kv_cache._tail_k, expected_tail, rtol=0, atol=0)
+
+
+def test_two_token_verification_matches_sequential_decode(rig):
+    model, ctx = rig
+    _reset(ctx)
+    _batch(ctx, [11, 17, 5], 0, "prefill")
+    model.forward()
+    from freetoken.speculative.mtp import StateSnapshot
+
+    snapshot = StateSnapshot(ctx)
+    for offset, token in enumerate([23, 31]):
+        _batch(ctx, [token], 3 + offset, "decode")
+        expected = model.forward()
+    expected_state = ctx.linear_state_pool.recurrent_states.clone()
+    snapshot.restore()
+    batch = _batch(ctx, [23, 31], 3, "prefill")
+    batch.speculative_verify = True
+    actual = model.forward()
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=1e-3)
+    torch.testing.assert_close(ctx.linear_state_pool.recurrent_states, expected_state,
+                               rtol=2e-2, atol=1e-3)
+
+
+def test_verifier_audit_preserves_batched_result(rig, monkeypatch, tmp_path):
+    import json
+    import runpy
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    from freetoken.core import Req, SamplingParams
+    from freetoken.speculative.mtp import MTPDecoder, StateSnapshot
+
+    model, ctx = rig
+    original = MTPDecoder._target
+    monkeypatch.setattr(MTPDecoder, "_target", original)
+    runpy.run_path(str(Path(__file__).parents[2] / "benchmarks/mtp/audit_server.py"))
+    output = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MTP_AUDIT_OUTPUT", str(output))
+
+    @contextmanager
+    def forward_batch(batch):
+        ctx.batch = batch
+        yield
+
+    engine = SimpleNamespace(
+        model=model, ctx=SimpleNamespace(forward_batch=forward_batch),
+        linear_state_pool=ctx.linear_state_pool, kv_cache=ctx.kv_cache,
+        page_table=ctx.page_table, attn_backend=ctx.attn_backend,
+        config=SimpleNamespace(model_config=SimpleNamespace(model_type="glm5_next")),
+        graph_runner=SimpleNamespace(mtp_verify_graph=None, can_use_cuda_graph=lambda b: False),
+    )
+    decoder = MTPDecoder(engine, None)
+    _reset(ctx)
+    _batch(ctx, [11, 17, 5], 0, "prefill")
+    model.forward()
+    snapshot = StateSnapshot(engine)
+    req = Req(torch.tensor([11, 17, 5, 23]), 0, 3, 8, 7, SamplingParams(), None)
+    req.linear_slot_idx = 1
+    batch = decoder._batch(req, 3, torch.tensor([23, 31], device=DEV), verify=True)
+    audited, _ = decoder._target(batch, all_logits=True)
+    audited_state = ctx.linear_state_pool.recurrent_states.clone()
+    snapshot.restore()
+    expected, _ = original(decoder, batch, all_logits=True)
+    torch.testing.assert_close(audited, expected, rtol=0, atol=0)
+    torch.testing.assert_close(ctx.linear_state_pool.recurrent_states, audited_state,
+                               rtol=0, atol=0)
+    assert json.loads(output.read_text())["logits"]["relative_rms"] < 0.05

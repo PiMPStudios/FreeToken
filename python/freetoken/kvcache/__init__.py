@@ -109,6 +109,9 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             if config.cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
+    spec_tokens = 0
+    if getattr(config, "experimental_mtp", False):
+        spec_tokens = max(0, int(getattr(config, "experimental_mtp_tokens", 1) or 1))
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
@@ -117,6 +120,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        num_speculative_tokens=spec_tokens,
     )
 
 
@@ -128,6 +132,7 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    num_speculative_tokens: int = 0,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -191,14 +196,18 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        num_global_layers = max(model_config.num_layers, max(spec.layer_ids) + 1)
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=num_global_layers,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,
             device=device,
+            ring_capacity=QSAKVCache.ring_capacity_for(
+                spec.index_ratio, num_speculative_tokens
+            ),
             index_head_dim=spec.index_head_dim,
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,

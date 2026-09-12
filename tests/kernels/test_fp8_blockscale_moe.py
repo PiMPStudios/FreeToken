@@ -2,6 +2,9 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
+
+from freetoken.kernel.triton.fp8_blockscale_moe import fused_experts_decode_fp8_blockscale
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -53,7 +56,7 @@ def _reference(x, gate_up, gate_up_scale, down, down_scale, w, ids, activation, 
 
 @pytest.mark.parametrize("activation, alpha, limit", [("silu", 1.0, float("inf")), ("swiglu_clamp", 1.0, 0.5), ("gelu_tanh", 1.0, float("inf"))])
 def test_fp8_block_moe_epilogues_match_the_reference(activation, alpha, limit):
-    from freetoken.kernel.triton.fp8_blockscale_moe import fused_experts_decode_fp8_blockscale, fused_experts_fp8_blockscale
+    from freetoken.kernel.triton.fp8_blockscale_moe import fused_experts_fp8_blockscale
 
     gate_up, gate_up_scale, down, down_scale = _experts()
     w, ids = _routing()
@@ -72,3 +75,38 @@ def test_fp8_block_moe_epilogues_match_the_reference(activation, alpha, limit):
     # W8A8 prefill quantizes the activations per 128-group, so the tolerance is the fp8 activation error
     assert torch.nn.functional.cosine_similarity(prefill.flatten(), ref.flatten(), dim=0) > 0.99
     assert (prefill - ref).abs().max() <= 8e-2 * ref.abs().max() + 1e-3
+
+
+@pytest.mark.parametrize("limit", [None, 10.0])
+def test_fp8_draft_experts_match_dequantized_reference(limit):
+    """The MTP draft experts keep GLM's clamped SwiGLU semantics through the shared decode kernel."""
+    torch.manual_seed(81)
+    device = "cuda"
+    m, h, inter, experts = 2, 256, 128, 3
+    x = (torch.randn(m, h, device=device) * 2).bfloat16()
+    gu = torch.randn(experts, 2 * inter, h, device=device).to(torch.float8_e4m3fn)
+    dn = torch.randn(experts, h, inter, device=device).to(torch.float8_e4m3fn)
+    gs = (torch.rand(experts, 2, 2, device=device) * 0.1 + 0.25).bfloat16()
+    ds = (torch.rand(experts, 2, 1, device=device) * 0.1 + 0.1).bfloat16()
+    ids = torch.tensor([[0, 2], [2, 1]], dtype=torch.int32, device=device)
+    weights = torch.tensor([[0.7, 0.3], [0.6, 0.4]], device=device)
+    result = fused_experts_decode_fp8_blockscale(
+        x, gu, gs, dn, ds, weights, ids,
+        activation="silu" if limit is None else "swiglu_clamp",
+        act_alpha=1.0,
+        act_limit=float("inf") if limit is None else limit,
+    )
+    gu_ref = gu.float() * gs.float().repeat_interleave(128, 1).repeat_interleave(128, 2)
+    dn_ref = dn.float() * ds.float().repeat_interleave(128, 1).repeat_interleave(128, 2)
+    expected = []
+    for row in range(m):
+        routed = []
+        for k in range(2):
+            e = int(ids[row, k])
+            gate, up = F.linear(x[row].float(), gu_ref[e]).bfloat16().float().chunk(2)
+            if limit is not None:
+                gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+            activated = (F.silu(gate) * up).bfloat16().float()
+            routed.append((F.linear(activated, dn_ref[e]) * weights[row, k]).bfloat16())
+        expected.append(torch.stack(routed).float().sum(0).bfloat16())
+    torch.testing.assert_close(result, torch.stack(expected), rtol=0.02, atol=0.5)

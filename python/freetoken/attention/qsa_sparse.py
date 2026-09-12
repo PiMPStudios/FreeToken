@@ -490,9 +490,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
 
     # ----- CUDA graph (decode) --------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(
+        self, max_seq_len: int, bs_list: List[int], verify_tokens: int = 2
+    ) -> None:
         self.capture_bs = sorted(bs_list)
-        max_bs = max(bs_list)
+        self._verify_tokens = max(2, int(verify_tokens))
+        max_bs = max(max(bs_list), self._verify_tokens, 2)
         width = get_global_ctx().page_table.shape[1]
         pages = -(-width // self.page_size)
         columns = pages * self.cmp_page_size
@@ -508,6 +511,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "table_idx": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device),
+            "token_to_req_verify": torch.zeros(
+                self._verify_tokens, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_verify": torch.tensor(
+                [0, self._verify_tokens], dtype=torch.int32, device=self.device
+            ),
             "logits": empty(chunk, columns, dtype=torch.float32),
             "visible": empty(max_bs, dtype=torch.int32),
             "blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
@@ -519,10 +528,33 @@ class QSASparseAttnBackend(BaseAttnBackend):
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
 
+    def _stage_verify(self, md: QSASparseMetadata, batch: Batch) -> None:
+        """Point a 1-request T-token verify batch at static graph buffers."""
+        t = int(batch.positions.numel())
+        table_idx = torch.tensor(
+            [batch.padded_reqs[0].table_idx], dtype=torch.int64, device=self.device
+        )
+        self._graph["block_table"][:1].copy_(
+            self._block_base_view().index_select(0, table_idx) // self.page_size
+        )
+        self._graph["kvlen"][:1].copy_(md.kv_len_cpu.to(self.device, non_blocking=True)[:1])
+        self._graph["table_idx"][:1].copy_(table_idx.to(torch.int32))
+        md.block_table = self._graph["block_table"][:1]
+        md.seq_lens = self._graph["kvlen"][:1]
+        md.ring_slots = self._graph["table_idx"][:1]
+        md.token_to_req = self._graph["token_to_req_verify"][:t]
+        cu = self._graph["cu_seqlens_verify"]
+        cu[1] = t
+        md.cu_seqlens = cu[:2]
+        md.positions = batch.positions
+
     def prepare_for_capture(self, batch: Batch) -> None:
         self.prepare_metadata(batch)
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
+        if getattr(batch, "speculative_verify", False):
+            self._stage_verify(md, batch)
+            return
         bs = batch.size
         dummy = torch.full(
             (bs,), batch.padded_reqs[0].table_idx, dtype=torch.int64, device=self.device
@@ -532,6 +564,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def prepare_for_replay(self, batch: Batch) -> None:
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
+        if getattr(batch, "speculative_verify", False):
+            self._stage_verify(md, batch)
+            return
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
 

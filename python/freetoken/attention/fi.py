@@ -266,7 +266,7 @@ class FlashInferBackend(BaseAttnBackend):
         super().reset_capture()
         self.graph_wrappers = {}
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], verify_tokens: int = 2) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)

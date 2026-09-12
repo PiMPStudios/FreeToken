@@ -257,6 +257,30 @@ class CacheManager:
         if self.swa_pool is not None and len(indices) > 0:
             self.swa_pool.free_swa(indices)
 
+    def release_mtp_extra_pages(self, reqs: List[Req]) -> None:
+        """Return KV pages MTP allocated past the tokens this step actually committed.
+
+        Extra verify slots are allocated at ``[device_len, device_len+k)``. A short
+        accept or reject never claims those pages, and ``cache_req`` only looks at
+        ``[:cached_len]``, so they would leak (2 pages on the 4500 k=2 run).
+        """
+        ps = self.page_size
+        for req in reqs:
+            end = req.mtp_extra_end_page
+            req.mtp_extra_end_page = None
+            if not end:
+                continue
+            # cache_req only inserts [:cached_len]. device_len is the next pending
+            # slot and may sit on a new page that finish will never own.
+            owned = div_ceil(req.cached_len, ps)
+            if end <= owned:
+                continue
+            start_tok = owned * ps
+            end_tok = end * ps
+            tail = self.page_table[req.table_idx, start_tok:end_tok]
+            self._free(tail)
+            self.page_table[req.table_idx, start_tok:end_tok] = 0
+
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []

@@ -64,6 +64,10 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Exclusive page index of MTP's speculative extra allocation (device_len+k).
+    # Pages in [ceil(device_len), mtp_extra_end_page) are unused after a short
+    # commit and must be returned or they leak at idle integrity.
+    mtp_extra_end_page: int | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -89,6 +93,10 @@ class Req:
         self.cached_len = self.device_len
         self.device_len += 1
 
+    def complete_n(self, n: int) -> None:
+        for _ in range(n):
+            self.complete_one()
+
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
         m = n + next_token.numel()
@@ -113,6 +121,7 @@ class Req:
 class Batch:
     reqs: List[Req]
     phase: Literal["prefill", "decode"]
+    speculative_verify: bool = False
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)

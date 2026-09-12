@@ -35,8 +35,12 @@ logger = init_logger(__name__)
 
 def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
     """The two token ids before ``position``; eos pads past the start."""
-    return [int(ids[position - 2]) if position >= 2 else eos,
-            int(ids[position - 1]) if position >= 1 else eos]
+    n = int(ids.numel())
+
+    def at(i: int) -> int:
+        return int(ids[i]) if 0 <= i < n else eos
+
+    return [at(position - 2), at(position - 1)]
 
 
 @dataclass(frozen=True)
@@ -210,6 +214,18 @@ class DiskRowTable:
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
         eos = self.eos_token_id
+        if getattr(batch, "speculative_verify", False):
+            # Both verify tokens are already on the host (MTP staged the proposal).
+            reqs = list(batch.padded_reqs)
+            runs = [
+                torch.cat((
+                    torch.tensor(_context(req.input_ids, req.cached_len, eos), dtype=torch.int64),
+                    req.input_ids[req.cached_len:req.device_len].to(torch.int64),
+                ))
+                for req in reqs
+            ]
+            self.fill(runs, graph=use_graph)
+            return None
         if batch.is_decode:
             reqs = list(batch.reqs)
             if use_graph and self._wait_sync:

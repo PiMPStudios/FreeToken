@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import gc
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+from freetoken.attention.linear import FLAMetadata
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
@@ -117,6 +119,8 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
+        mtp_verify: bool = False,
+        mtp_verify_tokens: int = 2,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -131,13 +135,18 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
-        self._capture_graphs(max_seq_len, vocab_size, model)
+        self.mtp_verify_graph = None
+        self.verify_buffer = None
+        self.verify_tokens = max(2, int(mtp_verify_tokens))
+        self._capture_graphs(max_seq_len, vocab_size, model, mtp_verify=mtp_verify)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.reset()
 
-    def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
+    def _capture_graphs(
+        self, max_seq_len: int, vocab_size: int, model: BaseLLMModel, *, mtp_verify: bool = False
+    ):
         # Mark the post-weights "warmup" phase for /health: this stretch (graph capture — or the
         # remaining readiness work when graphs are disabled) moves no bytes, so without this the
         # loader would sit at 100% (last byte bar) until the ready ack. total=0 ⇒ the desktop
@@ -148,7 +157,11 @@ class GraphRunner:
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
-        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
+        self.attn_backend.init_capture_graph(
+            max_seq_len=max_seq_len,
+            bs_list=self.graph_bs_list,
+            verify_tokens=self.verify_tokens,
+        )
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -197,9 +210,89 @@ class GraphRunner:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
 
+        if mtp_verify and self.max_graph_bs > 0:
+            self._capture_mtp_verify(model, vocab_size, pool)
+
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+
+    def _capture_mtp_verify(self, model: BaseLLMModel, vocab_size: int, pool) -> None:
+        """Capture a 1-request, T-token speculative-verify graph of the target model."""
+        t = self.verify_tokens
+        inner = getattr(model, "model", None)
+        decode_buf = getattr(inner, "_mtp_hidden_decode", None) if inner is not None else None
+        verify_buf = getattr(inner, "_mtp_hidden_verify", None) if inner is not None else None
+        if verify_buf is not None:
+            inner._mtp_hidden_buf = verify_buf
+        dummy = copy.copy(self.dummy_req)
+        dummy.cached_len = 1
+        dummy.device_len = 1 + t
+        dummy.max_device_len = 2 + t
+        dummy.input_ids = torch.zeros(dummy.max_device_len, dtype=torch.int32)
+        batch = Batch([dummy], "prefill")
+        batch.padded_reqs = batch.reqs
+        batch.speculative_verify = True
+        self.verify_buffer = GraphCaptureBuffer.init(t, vocab_size, self.device)
+        buf = self.verify_buffer
+        buf.input_ids.zero_()
+        buf.positions.copy_(
+            torch.arange(1, 1 + t, dtype=torch.int32, device=self.device)
+        )
+        dummy_slot = int(get_global_ctx().page_table[dummy.table_idx, 0].item())
+        buf.out_loc.fill_(dummy_slot)
+        slot = (
+            dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx
+        )
+        buf.table_idx[:1].fill_(slot)
+        batch.input_ids = buf.input_ids
+        batch.out_loc = buf.out_loc
+        batch.positions = buf.positions
+        batch.linear_table_idx = buf.table_idx[:1]
+        batch.active_table_idx = torch.tensor(
+            [dummy.table_idx], dtype=torch.int64, device=self.device
+        )
+        batch.fla_metadata = FLAMetadata(
+            cu_seqlens=torch.tensor([0, t], dtype=torch.int32, device=self.device),
+            cache_indices=buf.table_idx[:1],
+            has_initial_state=torch.tensor([True], dtype=torch.bool, device=self.device),
+        )
+        self.attn_backend.prepare_for_capture(batch)
+        graph = torch.cuda.CUDAGraph()
+        with get_global_ctx().forward_batch(batch), model.forward_host_ctx(batch, True):
+            logits = model.forward()
+            if logits.shape[0] != t:
+                raise RuntimeError(
+                    f"MTP verify graph warmup returned logits {tuple(logits.shape)}, "
+                    f"expected ({t}, vocab). Last-token LM head would clone rows."
+                )
+            buf.logits[:t].copy_(logits)
+            with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                buf.logits[:t].copy_(model.forward())
+            self._reset_moe_offload_cache()
+        if decode_buf is not None:
+            inner._mtp_hidden_buf = decode_buf
+        self.mtp_verify_graph = graph
+        self._verify_fla = batch.fla_metadata
+        logger.info_rank0(f"Captured {t}-token MTP verify CUDA graph")
+
+    def replay_mtp_verify(self, batch: Batch) -> torch.Tensor:
+        assert self.mtp_verify_graph is not None and self.verify_buffer is not None
+        t = self.verify_tokens
+        buf = self.verify_buffer
+        buf.input_ids.copy_(batch.input_ids)
+        buf.out_loc.copy_(batch.out_loc)
+        buf.positions.copy_(batch.positions)
+        if batch.linear_table_idx is not None:
+            buf.table_idx[:1].copy_(batch.linear_table_idx.reshape(-1)[:1])
+        batch.input_ids = buf.input_ids
+        batch.out_loc = buf.out_loc
+        batch.positions = buf.positions
+        batch.linear_table_idx = buf.table_idx[:1]
+        batch.fla_metadata = self._verify_fla
+        self.attn_backend.prepare_for_replay(batch)
+        self.mtp_verify_graph.replay()
+        return buf.logits[:t]
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
@@ -229,4 +322,6 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.buffer = None
+        self.mtp_verify_graph = None
+        self.verify_buffer = None
         gc.collect()

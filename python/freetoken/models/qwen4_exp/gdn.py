@@ -151,11 +151,16 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.is_decode or getattr(batch, "speculative_verify", False):
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            # The recurrent kernel needs contiguous channels; varlen conv returns a transpose.
+            mixed = (
+                self._conv_decode(conv_in, fla.cache_indices, pool) if batch.is_decode
+                else self._conv_prefill(conv_in, pool, fla.cu_seqlens,
+                                        fla.cache_indices, fla.has_initial_state).contiguous()
+            )
             B = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)

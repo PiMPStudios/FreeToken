@@ -124,6 +124,11 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        buf = getattr(self, "_mtp_hidden_buf", None)
+        if buf is not None and hidden.shape[0] == buf.shape[0]:
+            buf.copy_(hidden)
+        if getattr(self, "_capture_mtp_hidden", False):
+            self._mtp_hidden = hidden
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 

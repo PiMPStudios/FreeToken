@@ -116,10 +116,21 @@ class Glm5NextKDA(BaseOP):
         g2 = self.g_b_proj.forward(g_a)  # output-gate logits [T, H*D]
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
-            mixed = causal_conv1d_decode(
-                conv_in, pool.conv_states[li], self._conv_weight(), fla.cache_indices
-            )
+        if batch.is_decode or getattr(batch, "speculative_verify", False):
+            if batch.is_decode:
+                mixed = causal_conv1d_decode(
+                    conv_in, pool.conv_states[li], self._conv_weight(), fla.cache_indices
+                )
+                indices = fla.cache_indices
+            else:
+                assert len(batch.reqs) == 1
+                mixed = causal_conv1d_varlen(
+                    conv_in.transpose(0, 1).contiguous(), self._conv_weight(),
+                    pool.conv_states[li], fla.cu_seqlens, fla.cache_indices,
+                    fla.has_initial_state,
+                ).transpose(0, 1)
+                # The kernel stores each token's state through a contiguous [N, T] map.
+                indices = fla.cache_indices[:, None].repeat(1, total)
             bsz = mixed.shape[0]
             q, k, v = (
                 t.reshape(1, bsz, h, d).to(dtype)
@@ -130,7 +141,7 @@ class Glm5NextKDA(BaseOP):
                 g=g1.view(1, bsz, h, d),
                 beta=b.view(1, bsz, h),
                 state_pool=pool.recurrent_states[li],
-                indices=fla.cache_indices,
+                indices=indices,
                 cu_seqlens=fla.cu_seqlens,
                 a_log=self.A_log,
                 dt_bias=self.dt_bias,

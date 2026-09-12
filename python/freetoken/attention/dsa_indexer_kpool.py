@@ -56,8 +56,8 @@ class Glm5NextDSABackend(DSAAttnBackend):
     # ----- CUDA-graph decode staging ------------------------------------------------------
     # The tail rings are keyed by Req.table_idx; a captured decode step must read it
     # from a static buffer restaged per replay (rows/kvlen precedent in the parent).
-    def init_capture_graph(self, max_seq_len: int, bs_list) -> None:
-        super().init_capture_graph(max_seq_len, bs_list)
+    def init_capture_graph(self, max_seq_len: int, bs_list, verify_tokens: int = 2) -> None:
+        super().init_capture_graph(max_seq_len, bs_list, verify_tokens=verify_tokens)
         self._slots_buf = torch.zeros(max(bs_list), dtype=torch.int64, device=self.device)
 
     def _stage_decode(self, batch: "Batch", bs: int, table_idx: torch.Tensor) -> None:
@@ -87,11 +87,11 @@ class Glm5NextDSABackend(DSAAttnBackend):
 
     def _build_index_slots(self, args, config: "ModelConfig") -> None:
         # No IndexShare: every DSA layer owns its indexer and is its own leader.
-        for lid in args.dsa_layer_ids:
-            if lid >= config.num_layers:
-                continue
-            self._idx_slot[lid] = len(self._idx_slot)
-            self._leader[lid] = lid
+        for group in config.kv_cache_group_specs():
+            if group.mla and group.index_head_dim:
+                for lid in group.layer_ids:
+                    self._idx_slot[lid] = len(self._idx_slot)
+                    self._leader[lid] = lid
 
     # ----- store: fused single path (prefill AND decode, CUDA-graph capturable) ----------
     def _plan_kpool_writes(self, md, batch: "Batch", slot: int):

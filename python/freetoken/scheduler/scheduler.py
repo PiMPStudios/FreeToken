@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
@@ -22,6 +23,7 @@ from freetoken.message import (
     UserMsg,
 )
 from freetoken.utils import (
+    div_ceil,
     init_logger,
     load_eos_token_ids,
     load_tokenizer,
@@ -315,7 +317,9 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, output = last_data[0].batch, last_data[1]
+        _, next_tokens_cpu, copy_done, *extra = output
+        host_appended = extra[0] if extra else 0
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -346,42 +350,59 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+                row = (
+                    next_tokens_cpu
+                    if next_tokens_cpu.dim() == 1 and next_tokens_cpu.numel() > 1 and batch.size == 1
+                    else next_tokens_cpu[i].reshape(-1)
                 )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                finished = False
+                finish_reason = None
+                matched_stop = None
+                next_token = 0
+                # Per-output, not on the req: overlap already ran the next forward.
+                skip_host = host_appended if batch.size == 1 else 0
+                host_len_start = req.input_ids.numel()
+                toks = row.tolist()
+                for j, tok in enumerate(toks):
+                    if j >= skip_host:
+                        req.append_host(torch.tensor([tok], dtype=torch.int32))
+                    next_token = int(tok)
+                    logical_end = host_len_start - skip_host + j + 1
+                    # device_len already includes every token in this row; length
+                    # finishes on the last emitted token, not the first of a 2-commit.
+                    hit_length = j == len(toks) - 1 and not req.can_decode
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req, logical_end)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = logical_end
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
+                    if finished:
+                        break
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -429,17 +450,22 @@ class Scheduler(SchedulerIOMixin):
         )
         self.send_result(reply)
 
-    def _match_stop_str(self, req: Req) -> str | None:
+    def _match_stop_str(self, req: Req, end: int | None = None) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
         only a short suffix (bounded by the longest stop string's char length, so a stop of
-        N chars spans at most N tokens) to keep the per-step cost small."""
+        N chars spans at most N tokens) to keep the per-step cost small.
+
+        ``end`` is the exclusive host index after the token just emitted. MTP may have
+        already appended later tokens for PLE overlap; matching must not see those.
+        """
         stop_strs = req.sampling_params.stop_strs
         prompt_len = req.max_device_len - req.output_len
-        if len(req.input_ids) <= prompt_len:
+        ids = req.input_ids if end is None else req.input_ids[:end]
+        if len(ids) <= prompt_len:
             return None
         max_chars = max(len(s) for s in stop_strs)
-        tail_start = max(prompt_len, len(req.input_ids) - (max_chars + 1))
-        tail = self.tokenizer.decode(req.input_ids[tail_start:].tolist())
+        tail_start = max(prompt_len, len(ids) - (max_chars + 1))
+        tail = self.tokenizer.decode(ids[tail_start:].tolist())
         for s in stop_strs:
             if s in tail:
                 return s
@@ -810,6 +836,27 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
+        if (
+            batch.is_decode
+            and getattr(self.engine, "mtp_decoder", None) is not None
+        ):
+            from freetoken.speculative.mtp import mtp_verify_enabled
+
+            # Extra page is for the bonus token. Allocating it when verify is off
+            # leaks a page the request never owns (integrity check fires at idle).
+            if mtp_verify_enabled():
+                extra = []
+                k = max(1, int(getattr(self.engine.mtp_decoder, "k", 1)))
+                ps = self.cache_manager.page_size
+                for req in batch.reqs:
+                    if req.remain_len >= 2 and req.device_len + k <= self.engine.max_seq_len:
+                        req.mtp_extra_end_page = div_ceil(req.device_len + k, ps)
+                        slot = copy.copy(req)
+                        slot.cached_len = req.device_len
+                        slot.device_len = req.device_len + k
+                        extra.append(slot)
+                if extra:
+                    self.cache_manager.allocate_paged(extra)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
@@ -962,7 +1009,10 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        tokens = forward_output.next_tokens_gpu.reshape(-1)
+        _write_sampled_tokens(self.token_pool, output_mapping, tokens, batch.size)
+        if getattr(self.engine, "mtp_decoder", None) is not None and not batch.is_prefill:
+            self.cache_manager.release_mtp_extra_pages(batch.reqs)
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
@@ -1003,6 +1053,31 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _write_sampled_tokens(
+    token_pool: torch.Tensor,
+    output_mapping: Indice2D,
+    tokens: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """Scatter sampled ids into the device token pool.
+
+    Decode writes one id per request at ``output_mapping``. MTP may return extra
+    accepted drafts plus a bonus; those go in consecutive slots after each
+    request's write position (experimental MTP is bs=1).
+    """
+    token_pool[output_mapping] = tokens[:batch_size]
+    extra = tokens[batch_size:]
+    if extra.numel() == 0:
+        return
+    tables, positions = output_mapping
+    n = extra.numel()
+    if tables.numel() == 1:
+        pos = positions + torch.arange(1, n + 1, device=positions.device, dtype=positions.dtype)
+        token_pool[tables.expand(n), pos] = extra
+        return
+    token_pool[tables, positions + 1] = extra
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:

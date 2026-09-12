@@ -161,6 +161,30 @@ def test_chunk_and_recurrent_rules_agree():
     )
 
 
+@pytest.mark.parametrize("ratio", [2, 3])
+@pytest.mark.parametrize("verify_len", [2, 3])
+def test_two_token_verification_matches_sequential_decode(ratio, verify_len):
+    op, _ = _make_layer(ratio, seed=31)
+    ctx = _ctx(ratio)
+    _, reqs, _ = _prefill(op, ctx, [5], seed=32)
+    pool = ctx.linear_state_pool
+    conv, recurrent = pool.conv_states.clone(), pool.recurrent_states.clone()
+    hidden = torch.randn(verify_len, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    expected = torch.cat([_decode(op, ctx, reqs, row[None]) for row in hidden])
+    expected_state = pool.recurrent_states.clone()
+    expected_conv = pool.conv_states.clone()
+    pool.conv_states.copy_(conv)
+    pool.recurrent_states.copy_(recurrent)
+    reqs[0].cached_len, reqs[0].device_len = 5, 5 + verify_len
+    batch = Batch(reqs, "prefill", speculative_verify=True)
+    batch.padded_reqs = reqs
+    with ctx.forward_batch(batch):
+        actual = op.forward(hidden)
+    torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(pool.recurrent_states, expected_state, rtol=RTOL, atol=1e-3)
+    torch.testing.assert_close(pool.conv_states, expected_conv, rtol=1e-2, atol=1e-3)
+
+
 def test_output_gate_comes_from_the_config():
     """The gate activation is the group config's string, not a hardcoded silu. Both gates track
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""

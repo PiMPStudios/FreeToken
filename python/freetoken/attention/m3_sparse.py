@@ -368,8 +368,8 @@ class M3SparseAttnBackend(BaseAttnBackend):
         return out
 
     # ----- CUDA graph (decode) ------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
-        self.inner.init_capture_graph(max_seq_len, bs_list)
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], verify_tokens: int = 2) -> None:
+        self.inner.init_capture_graph(max_seq_len, bs_list, verify_tokens=verify_tokens)
         self.capture_bs = sorted(bs_list)
         max_bs = max(bs_list)
         width = get_global_ctx().page_table.shape[1]

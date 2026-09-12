@@ -217,3 +217,20 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+def test_factory_maps_speculative_layer_after_target_stack():
+    from freetoken.kvcache import create_kvcache_pool
+
+    spec = _spec(layer_ids=(1, 3, 5, 7, 8), num_index_layers=5)
+    mc = SimpleNamespace(
+        num_layers=8, has_swa_attention=False, has_linear_attention=True,
+        num_kv_heads=2, head_dim=64, dsv4_args=None,
+    )
+    mc.kv_cache_group_specs = lambda: (spec,)
+
+    pool = create_kvcache_pool(
+        mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV, num_req_slots=4
+    )
+    assert pool._kv_buffer.shape[1] == 5
+    assert pool.k_cache(8).shape == (4, 64, 2, 64)

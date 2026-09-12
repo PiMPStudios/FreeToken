@@ -102,6 +102,19 @@ def test_kv_specs_resolve_qsa():
     assert cfg.has_linear_attention
 
 
+def test_mtp_cache_does_not_add_target_experts_or_recurrent_layers():
+    from freetoken.speculative.mtp import with_mtp_cache
+
+    base = parse_config(_hf_config())
+    mtp = with_mtp_cache(base)
+    assert mtp.num_layers == base.num_layers
+    assert mtp.num_moe_layers == base.num_moe_layers
+    assert mtp.linear_attention_group() == base.linear_attention_group()
+    spec = next(s for s in mtp.kv_cache_group_specs() if s.attn_type is AttnType.QSA)
+    assert spec.layer_ids == (*range(3, 48, 4), 48)
+    assert spec.num_index_layers == 13
+
+
 def test_moe_dims():
     cfg = parse_config(_hf_config())
     assert cfg.num_experts == 512

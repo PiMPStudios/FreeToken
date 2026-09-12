@@ -91,6 +91,30 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """Incremental strings, one per message.
+
+        Same-uid messages in one call must be applied left to right so offsets
+        move between them. MTP can emit several tokens in a single drain; treating
+        those as one batch_decode used a stale surr_offset and streamed overlapping
+        prefixes (``TheThe userThe user``). Waves keep each uid unique so the
+        existing batched decode stays for the normal one-token-per-request case.
+        """
+        if not msgs:
+            return []
+        out: List[str] = []
+        start = 0
+        seen: set[int] = set()
+        for i, msg in enumerate(msgs):
+            if msg.uid in seen:
+                out.extend(self._detokenize_unique(msgs[start:i]))
+                start = i
+                seen = {msg.uid}
+            else:
+                seen.add(msg.uid)
+        out.extend(self._detokenize_unique(msgs[start:]))
+        return out
+
+    def _detokenize_unique(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

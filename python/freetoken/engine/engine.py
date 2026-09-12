@@ -322,6 +322,10 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Tokens already written to req.input_ids during the forward (MTP overlap). Drain
+    # must skip this many append_host calls; the count is per-output so overlap cannot
+    # steal it from the next step's result.
+    host_appended: int = 0
 
 
 class Engine:
@@ -335,6 +339,10 @@ class Engine:
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+        if config.experimental_mtp:
+            from freetoken.speculative.mtp import validate_mtp_config
+
+            validate_mtp_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -368,6 +376,11 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        self.mtp_decoder = None
+        if config.experimental_mtp:
+            from freetoken.speculative.mtp import MTPDecoder, load_mtp
+
+            self.mtp_decoder = MTPDecoder(self, load_mtp(config, self.device))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -492,6 +505,15 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            mtp_verify=bool(
+                getattr(self, "mtp_decoder", None) is not None
+                and config.model_config.model_type == "qwen4_exp"
+            ),
+            mtp_verify_tokens=(
+                int(getattr(self.mtp_decoder, "k", 1)) + 1
+                if getattr(self, "mtp_decoder", None) is not None
+                else 2
+            ),
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -969,6 +991,8 @@ class Engine:
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
+        if getattr(self, "mtp_decoder", None) is not None:
+            self.mtp_decoder.reset()
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
@@ -1015,10 +1039,23 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            mtp_verify=bool(
+                getattr(self, "mtp_decoder", None) is not None
+                and config.model_config.model_type == "qwen4_exp"
+            ),
+            mtp_verify_tokens=(
+                int(getattr(self.mtp_decoder, "k", 1)) + 1
+                if getattr(self, "mtp_decoder", None) is not None
+                else 2
+            ),
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if getattr(self, "mtp_decoder", None) is not None:
+            result = self.mtp_decoder.try_forward(batch)
+            if result is not None:
+                return result
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)

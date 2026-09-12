@@ -83,6 +83,9 @@ class EngineConfig:
     swa_num_pages_override: int | None = None
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
+    experimental_mtp: bool = False
+    # Draft tokens proposed per verify round (Qwen only; GLM stays at 1).
+    experimental_mtp_tokens: int = 1
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
@@ -136,6 +139,10 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
+        if self.experimental_mtp:
+            from freetoken.speculative.mtp import with_mtp_cache
+
+            model_config = with_mtp_cache(model_config)
         return replace(model_config, quant=quant)
 
     @property

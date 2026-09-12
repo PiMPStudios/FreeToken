@@ -23,6 +23,22 @@ _DSA_IDS = tuple(range(3, _NUM_LAYERS, 4))  # 3, 7, ..., 43
 _KDA_IDS = tuple(i for i in range(_NUM_LAYERS) if i not in _DSA_IDS)
 
 
+def test_mtp_cache_has_an_independent_dsa_slot():
+    from freetoken.attention.dsa_indexer_kpool import Glm5NextDSABackend
+    from freetoken.speculative.mtp import with_mtp_cache
+
+    base = parse_config(_hf_config())
+    mtp = with_mtp_cache(base)
+    assert mtp.num_moe_layers == base.num_moe_layers
+    assert mtp.linear_attention_group() == base.linear_attention_group()
+    backend = Glm5NextDSABackend.__new__(Glm5NextDSABackend)
+    backend._idx_slot, backend._leader = {}, {}
+    backend._build_index_slots(mtp.glm5_args, mtp)
+    assert backend._idx_slot == {lid: i for i, lid in enumerate((*_DSA_IDS, 45))}
+    spec = next(s for s in mtp.kv_cache_group_specs() if s.mla)
+    assert spec.num_index_layers == len(backend._idx_slot)
+
+
 def _layer_types() -> list[str]:
     return [
         "deepseek_sparse_attention" if i in _DSA_IDS else "linear_attention"
