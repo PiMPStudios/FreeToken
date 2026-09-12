@@ -559,14 +559,18 @@ async def anthropic_event_stream(
                 # Anthropic streams terminate on message_stop — no OpenAI-style
                 # `data: [DONE]` sentinel (it would be an unknown event to strict clients).
     except GenerationError as exc:
-        # Request-side failure (template rejection / over-length prompt). Match the
-        # non-streaming path's classification so Claude Code treats it as a client error
-        # rather than a server fault to retry.
+        # Match the non-streaming path: server_busy is overloaded_error (retry), everything
+        # else is invalid_request_error (do not retry). SSE headers are already sent, so
+        # this event type is the only signal the client gets.
         if block_open:
             for f in _stop_block():
                 yield f
         yield _event(AnthropicStreamEvent(
-            type="error", error=AnthropicError(type="invalid_request_error", message=str(exc)),
+            type="error",
+            error=AnthropicError(
+                type="overloaded_error" if exc.code == "server_busy" else "invalid_request_error",
+                message=str(exc),
+            ),
         ))
     except Exception as exc:  # noqa: BLE001 — surface as an Anthropic error event
         if block_open:

@@ -550,6 +550,36 @@ def test_stream_request_error_is_invalid_request_not_internal():
     assert err["message"].startswith("prompt is too long: 8181 tokens > 7223")
 
 
+def test_stream_server_busy_is_overloaded_error_not_invalid_request():
+    # Queue-timeout / overload on a stream whose headers are already sent: the error
+    # *event type* is the only signal. invalid_request_error makes Claude Code / pi
+    # abort the turn; overloaded_error matches the non-streaming 429 path.
+    from freetoken.server.generation import GenerationError
+
+    async def boom():
+        raise GenerationError("server busy: 5 in flight, cap 5", "server_busy")
+        yield  # noqa: unreachable — makes this an async generator
+
+    async def run():
+        out = []
+        async for frame in A.anthropic_event_stream(boom(), "claude-x", 1):
+            etype = data = None
+            for line in frame.split("\n"):
+                if line.startswith("event:"):
+                    etype = line[len("event:"):].strip()
+                elif line.startswith("data:"):
+                    data = json.loads(line[len("data:"):].strip())
+            out.append((etype, data))
+        return out
+
+    events = asyncio.run(run())
+    types = [e[0] for e in events]
+    assert types[-1] == "error", types
+    err = events[-1][1]["error"]
+    assert err["type"] == "overloaded_error", err
+    assert "cap 5" in err["message"]
+
+
 def test_stream_tool_block_closes_before_following_text():
     args = '{"city": "SF"}'
     events = [
