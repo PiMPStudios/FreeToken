@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -245,7 +246,13 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                enqueued_at=time.monotonic(),
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:

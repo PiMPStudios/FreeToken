@@ -111,6 +111,7 @@ class ErrorReplyMsg(BaseTokenizerMsg):
     uid: int
     error: str
     # Stable machine-readable reason, mirrored onto the wire as OpenAI's error `code` so a client
-    # can react without parsing prose. Today only "context_length_exceeded" (prompt longer than
-    # the servable context); None = no specific class, the message is all there is.
+    # can react without parsing prose. Known values: "context_length_exceeded" (prompt
+    # longer than the servable context), "server_busy" (queue wait timed out). None = no
+    # specific class, the message is all there is.
     code: str | None = None

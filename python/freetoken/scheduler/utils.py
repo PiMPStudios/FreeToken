@@ -18,6 +18,9 @@ class PendingReq:
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
     mm_embeds: torch.Tensor | None = None
+    # monotonic timestamp when the request entered pending_list. Used by the
+    # queue-wait timeout; 0 means "unset" (tests that build PendingReq by hand).
+    enqueued_at: float = 0.0
 
     @property
     def input_len(self) -> int:

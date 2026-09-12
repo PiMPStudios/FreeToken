@@ -41,7 +41,9 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
-| `--max-running-requests` | 4 | Max concurrently running requests |
+| `--max-running-requests` | 4 | Max concurrently running (GPU-slot) requests |
+| `--max-queued-requests` | 8 | Extra HTTP-accepted waiters beyond that; over the combined cap the API returns 429 `server_busy`. `-1` = unlimited |
+| `--queue-wait-timeout` | 30 | Seconds a waiter may sit without a GPU slot before it is failed with `server_busy`. `0` disables |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |

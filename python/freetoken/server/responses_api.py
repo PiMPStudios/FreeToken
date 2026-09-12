@@ -173,7 +173,8 @@ async def handle_responses(
     try:
         result = await generate_full(uid, spec, state, source="/v1/responses")
     except GenerationError as exc:
-        return _error_response(400, str(exc), exc.code)
+        status = 429 if exc.code == "server_busy" else 400
+        return _error_response(status, str(exc), exc.code)
     response = build_responses_response(result, req, response_id, created, cache_report=cache_report)
     return JSONResponse(content=response.model_dump(mode="json"))
 

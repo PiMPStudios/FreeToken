@@ -64,6 +64,10 @@ class ServerArgs(SchedulerConfig):
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
     gpu_assigned: "tuple[str, ...] | None" = None
+    # Extra HTTP-accepted requests beyond --max-running-requests. Total inflight
+    # cap is max_running_req + max_queued_requests. -1 disables the cap (legacy
+    # unbounded wait). Default 8: refuse with 429 rather than sit until the client dies.
+    max_queued_requests: int = 8
 
     @property
     def share_tokenizer(self) -> bool:
@@ -141,6 +145,24 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be a positive integer") from exc
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
+        return n
+
+    def _queued_requests(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be an integer") from exc
+        if n < -1:
+            raise argparse.ArgumentTypeError("must be >= -1 (-1 = unlimited)")
+        return n
+
+    def _nonneg_float(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0 (0 = disabled)")
         return n
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
@@ -280,6 +302,28 @@ def parse_args(
         dest="max_running_req",
         default=ServerArgs.max_running_req,
         help="The maximum number of running requests.",
+    )
+
+    parser.add_argument(
+        "--max-queued-requests",
+        type=_queued_requests,
+        default=ServerArgs.max_queued_requests,
+        help=(
+            "Extra requests accepted beyond --max-running-requests (waiting for a GPU "
+            "slot). Combined cap is running+queued; over that the API returns 429 "
+            "server_busy instead of holding the HTTP stream. -1 = unlimited."
+        ),
+    )
+
+    parser.add_argument(
+        "--queue-wait-timeout",
+        type=_nonneg_float,
+        default=SchedulerConfig.queue_wait_timeout,
+        help=(
+            "Seconds a request may wait in the scheduler queue without a GPU slot "
+            "before it is failed with code server_busy. 0 disables. Does not apply "
+            "to chunked prefills that already hold a slot."
+        ),
     )
 
     parser.add_argument(

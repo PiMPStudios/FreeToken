@@ -201,7 +201,12 @@ async def handle_chat_completion(
     try:
         result = await generate_full(uid, spec, state, source="/v1/chat/completions")
     except GenerationError as exc:
-        return create_error_response(str(exc), code=exc.code)
+        return create_error_response(
+            str(exc),
+            status_code=429 if exc.code == "server_busy" else 400,
+            err_type="server_error" if exc.code == "server_busy" else "invalid_request_error",
+            code=exc.code,
+        )
     message: dict[str, Any] = {"role": "assistant", "content": result.content}
     if result.reasoning:
         message["reasoning_content"] = result.reasoning
@@ -260,7 +265,13 @@ async def stream_chat_completion_chunks(
             # Request failed before producing output — emit an error chunk + [DONE] so the
             # client gets a terminal signal instead of a stalled stream.
             yield _sse(
-                {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "server_error" if exc.code == "server_busy" else "invalid_request_error",
+                        "code": exc.code,
+                    }
+                }
             )
             break
         if isinstance(ev, ReasoningDelta):
