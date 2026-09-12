@@ -20,6 +20,9 @@ class PendingReq:
     mm_items: list | None = None
     mrope_positions_full: torch.Tensor | None = None
     mrope_delta: int = 0
+    # monotonic timestamp when the request entered pending_list. Used by the
+    # queue-wait timeout; 0 means "unset" (tests that build PendingReq by hand).
+    enqueued_at: float = 0.0
 
     @property
     def input_len(self) -> int:

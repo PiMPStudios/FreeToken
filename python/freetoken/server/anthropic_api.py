@@ -138,6 +138,8 @@ async def handle_anthropic_messages(
     try:
         result = await generate_full(uid, spec, state, source="/v1/messages")
     except GenerationError as exc:
+        if exc.code == "server_busy":
+            return _anthropic_error_response(429, "overloaded_error", str(exc))
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
     response = anthropic_full_response(result, req.model, uid, cache_report=cache_report)
     return JSONResponse(content=response.model_dump(exclude_none=True))

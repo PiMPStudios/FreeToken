@@ -18,6 +18,10 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     decode_log_interval: int = 40
     special_token_ckpt: bool = False
+    # Seconds a request may sit in pending_list (not yet on a GPU slot) before the
+    # scheduler replies server_busy. 0 disables. Does not apply to chunked prefills
+    # already holding a table slot.
+    queue_wait_timeout: float = 30.0
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

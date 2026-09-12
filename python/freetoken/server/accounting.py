@@ -23,6 +23,21 @@ class AdmissionClosedError(RuntimeError):
     """A generation tried to enter after the prepare-stop gate was closed."""
 
 
+class ServerBusyError(RuntimeError):
+    """A generation was refused because the inflight cap is already full.
+
+    Distinct from AdmissionClosedError (503: engine is stopping/rebuilding). This is a
+    retryable 429: the engine is serving, but --max-running-requests plus
+    --max-queued-requests are occupied. ``retry_after`` is a hint in seconds.
+    """
+
+    def __init__(self, message: str, *, retry_after: int = 5, active: int = 0, cap: int = 0):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.active = active
+        self.cap = cap
+
+
 class AccountingDrainError(RuntimeError):
     """The engine could not reach a sealed accounting state within the bounded stop barrier."""
 
@@ -134,7 +149,21 @@ def register_accounting_routes(app: FastAPI, get_state: Callable[[], Any]) -> No
     async def _admission_closed(_: Request, exc: AdmissionClosedError) -> JSONResponse:
         return JSONResponse(status_code=503, content={"error": str(exc)})
 
+    async def _server_busy(_: Request, exc: ServerBusyError) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "server_error",
+                    "code": "server_busy",
+                }
+            },
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+
     app.add_exception_handler(AdmissionClosedError, _admission_closed)
+    app.add_exception_handler(ServerBusyError, _server_busy)
 
     @app.post("/v1/admin/prepare-stop")
     async def prepare_stop(request: Request, body: PrepareStopBody | None = None):

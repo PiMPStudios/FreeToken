@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -223,6 +223,7 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+        self._expire_queued_requests()
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -268,6 +269,7 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+        self._expire_queued_requests()
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
@@ -890,6 +892,59 @@ class Scheduler(SchedulerIOMixin):
             [
                 PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
                 for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
+            ]
+        )
+
+    def _expire_queued_requests(self) -> None:
+        """Fail pending requests that have waited too long without a GPU slot.
+
+        Chunked prefills already hold a table_idx — they are in-flight work, not
+        queue waiters, so they are never expired here. ``enqueued_at <= 0`` means
+        the timestamp was never stamped (tests that build PendingReq by hand).
+        """
+        config = getattr(self, "config", None)
+        timeout = float(getattr(config, "queue_wait_timeout", 0.0) or 0.0) if config else 0.0
+        if timeout <= 0:
+            return
+        prefill = getattr(self, "prefill_manager", None)
+        if prefill is None:
+            return
+        pending = prefill.pending_list
+        if not pending:
+            return
+        now = time.monotonic()
+        keep = []
+        expired = []
+        for req in pending:
+            if req.chunked_req is not None or req.enqueued_at <= 0:
+                keep.append(req)
+                continue
+            if now - req.enqueued_at < timeout:
+                keep.append(req)
+            else:
+                expired.append(req)
+        if not expired:
+            return
+        prefill.pending_list = keep
+        decode = getattr(self, "decode_manager", None)
+        running = len(getattr(decode, "running_reqs", ()) or ()) if decode else 0
+        logger.warning_rank0(
+            "Expiring %d queued request(s) after %.0fs without a GPU slot "
+            "(%d running, %d still queued)",
+            len(expired), timeout, running, len(keep),
+        )
+        self.send_result(
+            [
+                ErrorReplyMsg(
+                    uid=req.uid,
+                    error=(
+                        f"request waited {timeout:.0f}s in queue without a GPU slot "
+                        f"({running} running, {len(keep)} still queued); "
+                        f"retry or raise --max-running-requests"
+                    ),
+                    code="server_busy",
+                )
+                for req in expired
             ]
         )
 

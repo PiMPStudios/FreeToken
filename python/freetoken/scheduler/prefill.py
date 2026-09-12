@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -286,6 +287,7 @@ class PrefillManager:
                 mm_items=req.mm_items,
                 mrope_positions_full=req.mrope_positions,
                 mrope_delta=req.mrope_delta,
+                enqueued_at=time.monotonic(),
             )
         )
 

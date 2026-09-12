@@ -37,7 +37,7 @@ from pydantic import BaseModel
 
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
-from .accounting import AdmissionClosedError, register_accounting_routes
+from .accounting import AdmissionClosedError, ServerBusyError, register_accounting_routes
 from .control_api import register_control_routes
 from .openai_api import register_openai_routes
 from . import request_ring
@@ -236,6 +236,22 @@ class FrontendManager:
             raise AdmissionClosedError(
                 f"server unavailable: engine is {self.maintenance_state}"
             )
+        queued_cap = int(getattr(self.config, "max_queued_requests", 8))
+        if queued_cap >= 0:
+            running_cap = int(getattr(self.config, "max_running_req", 4))
+            cap = running_cap + queued_cap
+            active = int(self.stats.active)
+            if active >= cap:
+                timeout = float(getattr(self.config, "queue_wait_timeout", 30.0) or 0.0)
+                retry_after = max(1, int(timeout) if timeout > 0 else 5)
+                raise ServerBusyError(
+                    f"server busy: {active} in flight, cap {cap} "
+                    f"(--max-running-requests {running_cap} + "
+                    f"--max-queued-requests {queued_cap})",
+                    retry_after=retry_after,
+                    active=active,
+                    cap=cap,
+                )
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
