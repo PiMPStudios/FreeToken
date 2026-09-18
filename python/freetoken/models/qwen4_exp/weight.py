@@ -3,7 +3,7 @@
 Three separate paths, because the checkpoint's three weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_DenseFuser``.
-* :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
+* :func:`load_ple_table` -- the n-gram table (the FP8 release's ~47.7 GiB of F8_E4M3 rows, the bf16 release's ~95 GiB), 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
 Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is kept only when the model built the tower.
@@ -28,29 +28,38 @@ from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
-from freetoken.layers.quantization import get_quant_config
+from freetoken.layers.quantization import QuantKind, get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
-# Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
-# weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
-# stacked ``mtp.layers.N.mlp.experts.*`` tensors.
-_EXPERT_KEY_RE = re.compile(
+# Routed NVFP4 experts: per-expert, un-fused. Matched against the RAW weight_map key in
+# nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's stacked
+# ``mtp.layers.N.mlp.experts.*`` tensors. The kind names follow the checkpoint's dialect:
+# ModelOpt stores weight / weight_scale / weight_scale_2, compressed-tensors stores
+# weight_packed / weight_scale / weight_global_scale.
+_EXPERT_KEY_TEMPLATE = (
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>{kinds})$"
 )
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
+# role -> the expert bank reader's canonical (ModelOpt) tensor kind
+_BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2"}
+# The ModelOpt spec, the dialect the released NVFP4 checkpoints use; the kind names stay the
+# canonical ones and the global scale is consumed as stored (the dequant-side dequant factor).
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
-    key_pattern=_EXPERT_KEY_RE,
+    key_pattern=re.compile(_EXPERT_KEY_TEMPLATE.format(kinds="|".join(map(re.escape, _BANK_KINDS.values())))),
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
-# Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+# Dropped dense-tensor suffixes. ``.weight_scale_2`` / ``.input_scale`` are per-tensor quant
+# scales the model does not keep; the dense ``.weight_scale`` (the FP8 per-channel scales of the
+# compressed-tensors releases) is kept: the FP8 modules register it as a buffer. Expert and PLE
+# scales are already excluded by _EXPERT_RE / _PLE_TABLE_INFIX above.
+_SCALE_SUFFIXES = (".weight_scale_2", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -79,7 +88,7 @@ _ZERO_CENTERED_NORM_SUFFIXES = (
 # The top-level hyper_connection_mixer has no injection and never fuses.
 _PAD_TO = {"input_mix_weight_down_block_inject": 16}
 _HC_WITH_INJECT = (".attn_hyper_connection", ".mlp_hyper_connection")
-_KIND_SUFFIXES = (".weight_scale_inv", ".weight")
+_KIND_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".weight")
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
@@ -146,6 +155,10 @@ class _DenseFuser:
             if scheme is None or not scheme.has("weight_scale_inv"):
                 raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
             return
+        if name.endswith(".weight_scale"):
+            if scheme is None or not scheme.has("weight_scale"):
+                raise ValueError(f"{name}: {module} has no per-channel scale in the checkpoint's quant config ({scheme})")
+            return
         is_fp8 = tensor.dtype in _FP8_DTYPES
         if scheme is None:
             if is_fp8:
@@ -158,10 +171,16 @@ class _DenseFuser:
         if rows > 1 and tensor.shape[0] % rows or cols > 1 and tensor.shape[1] % cols:
             raise ValueError(f"{name}: {tuple(tensor.shape)} is not a multiple of the {rows}x{cols} scale block of {module}")
 
-    def check_unfused(self, name: str, tensor: torch.Tensor) -> None:
+    def check_unfused(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        """Validate a tensor that is not part of a fusion; return it (normalized) to yield."""
         module, kind = _split_kind(name)
         if kind == ".weight_scale_inv" or (kind == ".weight" and tensor.dtype in _FP8_DTYPES):
             self.check(module, name, tensor)
+            return tensor
+        if kind == ".weight_scale":
+            self.check(module, name, tensor)
+            return _flatten_scale(name, tensor)
+        return tensor
 
     def fuse(self, name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]] | None:
         """Buffer a part; return the merged ``[(name, tensor)]`` once its kind is complete, ``[]`` while incomplete, ``None`` if ``name`` is not a part."""
@@ -181,11 +200,24 @@ class _DenseFuser:
             return []
         del self.buf[(fused, kind)]
         rows = [slots[i] for i in range(len(parts))]
-        pad_to = _PAD_TO.get(fused.rpartition(".")[2], 0) if kind == ".weight" else 0
+        # a zero-padded weight row needs its scale row zeroed too, so pad scales like weights
+        pad_to = _PAD_TO.get(fused.rpartition(".")[2], 0) if kind in (".weight", ".weight_scale") else 0
         pad = (-sum(t.shape[0] for t in rows)) % pad_to if pad_to else 0
         if pad:
             rows.append(torch.zeros(pad, *rows[0].shape[1:], dtype=rows[0].dtype, device=rows[0].device))
-        return [(fused + kind, torch.cat(rows, dim=0))]
+        merged = torch.cat(rows, dim=0)
+        if kind == ".weight_scale":
+            merged = _flatten_scale(fused + kind, merged)
+        return [(fused + kind, merged)]
+
+
+def _flatten_scale(name: str, scale: torch.Tensor) -> torch.Tensor:
+    """Checkpoint per-row scales are ``[out, 1]``; the model's buffer is 1-D ``[out]``."""
+    if scale.ndim == 2:
+        return scale.reshape(scale.shape[0])
+    if scale.numel() == 1:
+        raise ValueError(f"{name}: per-tensor dense scale is not supported (store per-row [out, 1] scales)")
+    return scale
 
 
 def iter_weights(
@@ -200,6 +232,11 @@ def iter_weights(
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the model's state dict minus the routed experts.
     A dense projection is bf16 or 128x128 block-fp8 (``.weight`` e4m3 + ``.weight_scale_inv``) as the checkpoint's QuantConfig says: the official releases skip everything but the routed experts, the community NVFP4-FP8 requants quantize the attention / GDN projections.
+    Dense projections are bf16, 128x128 block-fp8 (``.weight`` e4m3 + ``.weight_scale_inv``) or
+    compressed-tensors per-channel FP8 (``.weight`` e4m3 + a 2-D ``[out, 1]`` ``.weight_scale``,
+    flattened to the modules' 1-D scale buffer) as the checkpoint's QuantConfig says: the official
+    releases skip everything but the routed experts, the community NVFP4-FP8 requants quantize the
+    attention / GDN projections.
     Fusions, per kind: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + bf16 ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
@@ -226,8 +263,7 @@ def iter_weights(
                 tensor = f.get_tensor(raw_name)
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
-                    fuser.check_unfused(name, tensor)
-                    yield name, tensor
+                    yield name, fuser.check_unfused(name, tensor)
                 else:
                     yield from fused
 
@@ -251,18 +287,20 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
 
 @dataclass(frozen=True)
 class PleTable:
-    """The filled n-gram table: one pinned host bank plus the checkpoint's per-tensor FP8 scale."""
+    """The filled n-gram table: one pinned host bank plus its scalar per-tensor scale."""
 
     bank: HostBank
-    weight_scale: torch.Tensor  # scalar, checkpoint dtype (bf16)
+    weight_scale: torch.Tensor  # scalar; the FP8 release's weight_scale, 1.0 for bf16 tables
 
     @property
     def tensor(self) -> torch.Tensor:
-        """``[total_rows, ngram_head_dim]`` float8_e4m3fn view of the bank."""
+        """``[total_rows, ngram_head_dim]`` view of the bank (F8_E4M3 or bf16 rows)."""
         return self.bank.tensor
 
 
-_PLE_ST_DTYPE = "F8_E4M3"
+# The two released table layouts: F8_E4M3 rows + a scalar weight_scale, or plain BF16 rows
+# with no scale (gathered rows are used as-is).
+_PLE_ST_DTYPES = {"F8_E4M3": torch.float8_e4m3fn, "BF16": torch.bfloat16}
 
 
 def _safetensors_header(path: str) -> tuple[dict, int]:
@@ -322,11 +360,14 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     The checkpoint splits the table into ``split_ngram_parts`` equal row blocks named by shard
     index and scattered over the ``model-plefp8-*`` shards in header (lexicographic) order, so the
     bank is filled shard by shard at ``shard_index * rows_per_shard``. Each read is O_DIRECT: the
-    table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
+    table is ~47.7 GiB (FP8) or ~95 GiB (bf16) and must not also sit in the page cache while the
+    bank holds the same bytes. The FP8 layout carries a scalar ``weight_scale``; the bf16 layout
+    stores plain rows and is used unscaled.
     """
     folder = download_hf_weight(model_path)
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
+    st_dtype: torch.dtype | None = None
     rows = cols = 0
     for path in _ple_table_files(folder):
         header, base = _safetensors_header(path)
@@ -340,8 +381,13 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            if meta["dtype"] != _PLE_ST_DTYPE:
+            st = _PLE_ST_DTYPES.get(meta["dtype"])
+            if st is None:
                 raise ValueError(f"PLE table shard {key} has unsupported dtype {meta['dtype']}")
+            if st_dtype is None:
+                st_dtype = st
+            elif st != st_dtype:
+                raise ValueError(f"PLE table shards mix dtypes ({st_dtype} and {st}); one table is one dtype")
             shape = meta["shape"]
             if rows and tuple(shape) != (rows, cols):
                 raise ValueError(f"PLE table shard {key} is {shape}, expected {[rows, cols]}")
@@ -357,10 +403,12 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     if cols != qwen4_args.ngram_head_dim:
         raise ValueError(f"PLE table row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
     if scale is None:
-        raise ValueError("PLE table has no weight_scale")
+        if st_dtype is not torch.bfloat16:
+            raise ValueError("PLE table has no weight_scale")
+        scale = torch.tensor(1.0)
 
-    bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
-    shard_bytes = rows * cols
+    bank = HostBank((expected * rows, cols), st_dtype)
+    shard_bytes = rows * cols * torch.zeros((), dtype=st_dtype).element_size()
     bar = byte_bar(expected * shard_bytes, "Loading PLE table")
     try:
         buf = bank.memoryview()
@@ -382,8 +430,21 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 # ======================================================================================
 
 
-def nvfp4_expert_spec(model_path: str, config):
-    return _NVFP4_SOURCE_SPEC
+def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
+    """The per-expert NVFP4 layout under the checkpoint's dialect names (ModelOpt or compressed-tensors)."""
+    quant = get_quant_config()
+    if quant is None or quant.dialect != "compressed-tensors":
+        return _NVFP4_SOURCE_SPEC
+    stored = quant.stored_tensors(QuantKind.NVFP4)
+    kind_map = {stored[role].name: kind for role, kind in _BANK_KINDS.items()}
+    return Nvfp4ExpertSourceSpec(
+        key_pattern=re.compile(_EXPERT_KEY_TEMPLATE.format(kinds="|".join(map(re.escape, kind_map)))),
+        proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+        layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+        desc=f"Qwen3.8-Flash-Next NVFP4 experts ({quant.dialect})",
+        kind_map=kind_map,
+        global_reciprocal=stored["weight_global"].reciprocal,
+    )
 
 
 __all__ = [

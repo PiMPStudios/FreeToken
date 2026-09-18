@@ -22,7 +22,7 @@ from freetoken.utils import init_logger
 from .weight import (
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
-    _PLE_ST_DTYPE,
+    _PLE_ST_DTYPES,
     _ple_table_files,
     _safetensors_header,
 )
@@ -75,8 +75,11 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            if meta["dtype"] != _PLE_ST_DTYPE:
-                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}")
+            if meta["dtype"] not in _PLE_ST_DTYPES:
+                raise ValueError(f"PLE shard {key} has unsupported dtype {meta['dtype']}, expected one of {sorted(_PLE_ST_DTYPES)}")
+            if meta["dtype"] == "BF16":
+                # row decoding below is byte-wise fp8; a bf16 table needs the pinned backend
+                raise ValueError(f"PLE shard {key} is bf16; the disk PLE backend serves FP8 tables only")
             if rows and tuple(meta["shape"]) != (rows, cols):
                 raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
             rows, cols = meta["shape"]

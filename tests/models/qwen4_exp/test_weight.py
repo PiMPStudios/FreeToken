@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -19,8 +20,10 @@ from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseFuser,
+    _NVFP4_SOURCE_SPEC,
     iter_weights,
     load_ple_table,
+    nvfp4_expert_spec,
 )
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
@@ -149,11 +152,64 @@ def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
     return raw
 
 
+_CT_EXPERT_RE = re.compile(
+    r"^(.*\.mlp\.experts\.\d+\.(gate|up|down)_proj)\.(weight|weight_scale|weight_scale_2|input_scale)$"
+)
+
+
+def _raw_checkpoint_ct() -> dict[str, torch.Tensor]:
+    """The compressed-tensors release: per-channel FP8 attention / GDN projections plus the
+    ``weight_packed`` / ``weight_scale`` / ``weight_global_scale`` NVFP4 experts, no activation scales."""
+    raw = _raw_checkpoint()
+    gdn, attn = f"{LM}.layers.0.linear_attn", f"{LM}.layers.1.self_attn"
+    for module in (f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z", f"{gdn}.out_proj",
+                   *(f"{attn}.{p}_proj" for p in "qkvo")):
+        weight = raw[f"{module}.weight"].to(torch.float8_e4m3fn)
+        raw[f"{module}.weight"] = weight
+        raw[f"{module}.weight_scale"] = torch.rand(weight.shape[0], 1).to(torch.bfloat16)
+    ct: dict[str, torch.Tensor] = {}
+    for name, tensor in raw.items():
+        m = _CT_EXPERT_RE.match(name)
+        if m is None:
+            ct[name] = tensor
+            continue
+        base, kind = m.group(1), m.group(3)
+        if kind == "weight":
+            ct[f"{base}.weight_packed"] = tensor
+        elif kind == "weight_scale":
+            ct[f"{base}.weight_scale"] = tensor
+        elif kind == "weight_scale_2":
+            ct[f"{base}.weight_global_scale"] = tensor.to(torch.float32).reshape(1)
+        # .input_scale: the release quantizes no activations, so it stores none
+    return ct
+
+
 FP8_DENSE_QUANT = mixed_precision_quant(gdn_layers=(0,), attn_layers=(1,), moe_layers=(0, 1))
 
+# compressed-tensors (llm-compressor) MIXED_PRECISION: per-channel FP8 attention / GDN
+# projections (the OrcaRouter release's layout) with NVFP4 routed experts
+CT_DENSE_QUANT = {
+    "quant_method": "compressed-tensors",
+    "format": "mixed-precision",
+    "quantization_status": "compressed",
+    "config_groups": {
+        "group_0": {
+            "targets": [
+                r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$",
+                r"re:.*self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
+            ],
+            "weights": {"num_bits": 8, "type": "float", "strategy": "channel"},
+        },
+        "group_1": {
+            "targets": [r"re:.*mlp\.experts\.\d+\.(gate|up|down)_proj$"],
+            "weights": {"num_bits": 4, "type": "float", "strategy": "tensor_group", "group_size": 16},
+        },
+    },
+}
 
-def _config_json(quantization_config) -> dict:
-    cfg = hf_config(
+
+def _hf_fixture_config():
+    return hf_config(
         num_layers=2, head_dim=AHD, num_q=QH, num_kv=KVH, index_head_dim=IHD, index_heads=2,
         budget=16, hidden=H, max_position=4096, rope_theta=10000.0,
         layer_types=["linear_attention", "full_attention"],
@@ -162,6 +218,10 @@ def _config_json(quantization_config) -> dict:
         hc_lowrank=LR, ple_layer_ids=[1],
         num_experts=E, moe_intermediate_size=I, shared_expert_intermediate_size=I,
     )
+
+
+def _config_json(quantization_config) -> dict:
+    cfg = _hf_fixture_config()
     return {**vars(cfg), "text_config": vars(cfg.text_config), "quantization_config": quantization_config}
 
 
@@ -223,8 +283,22 @@ def checkpoint_fp8(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
 
 
 @pytest.fixture(scope="module")
+def checkpoint_ct(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    """Per-channel FP8 dense projections + compressed-tensors NVFP4 experts (the OrcaRouter layout)."""
+    torch.manual_seed(3)
+    return _write_checkpoint(
+        tmp_path_factory.mktemp("qwen4_exp_ct_ckpt"), _raw_checkpoint_ct(), CT_DENSE_QUANT
+    )
+
+
+@pytest.fixture(scope="module")
 def loaded_fp8(checkpoint_fp8) -> dict[str, torch.Tensor]:
     return _load(checkpoint_fp8[0])
+
+
+@pytest.fixture(scope="module")
+def loaded_ct(checkpoint_ct) -> dict[str, torch.Tensor]:
+    return _load(checkpoint_ct[0])
 
 
 def test_tower_keys_come_out_under_the_prefix_load_weight_filters(loaded):
@@ -355,6 +429,40 @@ def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
         load_ple_table(folder, args, pin=False)
 
 
+def test_load_ple_table_accepts_a_bf16_table_without_scale(tmp_path):
+    """The bf16 release stores plain rows and no scale; the bank is bf16 and the scale defaults to 1.0."""
+    prefix = f"{LM}.layers.0.ple.ple_embedding.ngram_embedding"
+    shards = {
+        f"{prefix}.shard_{i}.weight": torch.randn(NGRAM_ROWS, NGRAM_DIM).to(torch.bfloat16)
+        for i in range(NGRAM_SHARDS)
+    }
+    save_file(shards, str(tmp_path / "model.safetensors"))
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    table = load_ple_table(str(tmp_path), args, pin=False)
+    assert table.tensor.dtype is torch.bfloat16
+    assert table.tensor.shape == (NGRAM_SHARDS * NGRAM_ROWS, NGRAM_DIM)
+    assert float(table.weight_scale) == 1.0
+    for shard in range(NGRAM_SHARDS):
+        assert torch.equal(table.tensor[shard * NGRAM_ROWS: (shard + 1) * NGRAM_ROWS],
+                           shards[f"{prefix}.shard_{shard}.weight"])
+
+
+def test_load_ple_table_requires_a_scale_for_fp8(tmp_path):
+    """An FP8 table without its scalar scale cannot be served: the gathered rows would be unrescaled."""
+    prefix = f"{LM}.layers.0.ple.ple_embedding.ngram_embedding"
+    shards = {
+        f"{prefix}.shard_{i}.weight": (
+            torch.arange(i * NGRAM_ROWS * NGRAM_DIM, (i + 1) * NGRAM_ROWS * NGRAM_DIM)
+            .remainder(200).to(torch.uint8).view(NGRAM_ROWS, NGRAM_DIM).view(torch.float8_e4m3fn)
+        )
+        for i in range(NGRAM_SHARDS)
+    }
+    save_file(shards, str(tmp_path / "model.safetensors"))
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    with pytest.raises(ValueError, match="no weight_scale"):
+        load_ple_table(str(tmp_path), args, pin=False)
+
+
 # ======================================================================================
 # read_range_into: the O_DIRECT byte-range read the PLE table load is built on
 # ======================================================================================
@@ -457,20 +565,28 @@ FP8_MODULES = (
 )
 
 
-@pytest.mark.parametrize("fixture", ["checkpoint", "checkpoint_nvfp4", "checkpoint_fp8"])
+@pytest.mark.parametrize("fixture", ["checkpoint", "checkpoint_nvfp4", "checkpoint_fp8", "checkpoint_ct"])
 def test_emitted_keys_are_the_model_state_dict(fixture, request):
     """The reader fills exactly the buffers the engine builds from the same config, block-fp8 ones with the stored dtypes."""
     folder, _raw = request.getfixturevalue(fixture)
     loaded, state = _load(folder, vision=False), meta_state_dict(folder)
     assert set(loaded) == set(state)
-    if fixture != "checkpoint_fp8":
-        assert loaded["model.layers.0.linear_attn.in_proj.weight"].dtype is torch.bfloat16
+    if fixture == "checkpoint_fp8":
+        for module in FP8_MODULES:
+            for kind in (".weight", ".weight_scale_inv"):
+                assert loaded[module + kind].shape == state[module + kind].shape, module + kind
+            assert loaded[module + ".weight"].dtype is state[module + ".weight"].dtype is torch.float8_e4m3fn
+            assert loaded[module + ".weight_scale_inv"].dtype is torch.float32  # the engine casts it to the bf16 buffer at load
         return
-    for module in FP8_MODULES:
-        for kind in (".weight", ".weight_scale_inv"):
-            assert loaded[module + kind].shape == state[module + kind].shape, module + kind
-        assert loaded[module + ".weight"].dtype is state[module + ".weight"].dtype is torch.float8_e4m3fn
-        assert loaded[module + ".weight_scale_inv"].dtype is torch.float32  # the engine casts it to the bf16 buffer at load
+    if fixture == "checkpoint_ct":
+        for module in FP8_MODULES:
+            assert loaded[module + ".weight"].dtype is state[module + ".weight"].dtype is torch.float8_e4m3fn
+            assert loaded[module + ".weight"].shape == state[module + ".weight"].shape, module
+            # the reader emits the checkpoint's bf16 per-row scales; the engine casts them to the fp32 buffer
+            assert loaded[module + ".weight_scale"].dtype is torch.bfloat16
+            assert loaded[module + ".weight_scale"].shape == state[module + ".weight_scale"].shape, module
+        return
+    assert loaded["model.layers.0.linear_attn.in_proj.weight"].dtype is torch.bfloat16
 
 
 def _assert_fused_per_kind(loaded, raw, fused: str, parts: list[str]) -> None:
@@ -497,6 +613,85 @@ def test_fp8_projections_fuse_per_kind(loaded_fp8, checkpoint_fp8):
                  "model.hyper_connection_mixer.input_mix_weight_down.weight",
                  "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"):
         assert loaded_fp8[name].dtype is torch.bfloat16
+
+
+# ======================================================================================
+# the compressed-tensors release: per-channel FP8 dense scales + NVFP4 expert dialect
+# ======================================================================================
+
+
+def test_ct_dense_scales_fuse_and_flatten(loaded_ct, checkpoint_ct):
+    """Per-row scales ride the same fusions as the weights and come out 1-D [out]."""
+    _folder, raw = checkpoint_ct
+    gdn, attn = f"{LM}.layers.0.linear_attn", f"{LM}.layers.1.self_attn"
+    for fused, parts in (
+        ("model.layers.0.linear_attn.in_proj_qkvz", [f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z"]),
+        ("model.layers.1.self_attn.qkv_proj", [f"{attn}.{p}_proj" for p in "qkv"]),
+    ):
+        got = loaded_ct[fused + ".weight_scale"]
+        assert got.ndim == 1 and got.shape[0] == sum(raw[f"{p}.weight"].shape[0] for p in parts)
+        assert torch.equal(got, torch.cat([raw[f"{p}.weight_scale"] for p in parts], dim=0).reshape(-1)), fused
+    for name, part in (
+        ("model.layers.0.linear_attn.out_proj", f"{gdn}.out_proj"),
+        ("model.layers.1.self_attn.o_proj", f"{attn}.o_proj"),
+    ):
+        got = loaded_ct[name + ".weight_scale"]
+        assert got.ndim == 1 and got.shape == (raw[f"{part}.weight"].shape[0],)
+        assert torch.equal(got, raw[f"{part}.weight_scale"].reshape(-1)), name
+    # the unquantized GDN b|a projections stay bf16 and carry no scale
+    assert loaded_ct["model.layers.0.linear_attn.in_proj_ba.weight"].dtype is torch.bfloat16
+    assert "model.layers.0.linear_attn.in_proj_ba.weight_scale" not in loaded_ct
+
+
+def test_ct_expert_spec_maps_the_dialect(checkpoint_ct, checkpoint_nvfp4):
+    folder, _raw = checkpoint_ct
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    assert spec.kind_map == {
+        "weight_packed": "weight",
+        "weight_scale": "weight_scale",
+        "weight_global_scale": "weight_scale_2",
+    }
+    assert spec.global_reciprocal  # the checkpoint stores the quant-side global scale
+    key = f"{LM}.layers.0.mlp.experts.1.up_proj"
+    assert spec.key_pattern.match(f"{key}.weight_packed")
+    assert spec.key_pattern.match(f"{key}.weight_global_scale")
+    assert spec.key_pattern.match(f"{key}.weight") is None  # the modelopt name is not this dialect's
+    # the ModelOpt checkpoints keep the original spec, unchanged
+    install_quant_config(checkpoint_nvfp4[0])
+    assert nvfp4_expert_spec(checkpoint_nvfp4[0], None) is _NVFP4_SOURCE_SPEC
+
+
+def test_ct_expert_pieces_ingest_the_reciprocal_global(checkpoint_ct):
+    """End-to-end expert reader: the CT key names locate every piece, and the global scale is reciprocated."""
+    folder, raw = checkpoint_ct
+    install_quant_config(folder)
+    from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+    from freetoken.models.qwen4_exp.config import parse_config
+
+    cfg = parse_config(_hf_fixture_config())
+    pieces = list(iter_nvfp4_expert_pieces(folder, cfg, nvfp4_expert_spec(folder, cfg)))
+    got = {(li, e0): piece for li, e0, _e1, piece in pieces}
+    assert sorted(got) == [(li, e) for li in range(2) for e in range(E)]
+    for li in range(2):
+        for e in range(E):
+            base = f"{LM}.layers.{li}.mlp.experts.{e}"
+            piece = got[li, e]
+            assert torch.equal(piece["gate"], raw[f"{base}.gate_proj.weight_packed"].unsqueeze(0))
+            assert torch.equal(piece["gate_scale"], raw[f"{base}.gate_proj.weight_scale"].unsqueeze(0))
+            # 1 / the stored quant-side global scale, as fp16
+            assert torch.equal(piece["gate_global"].reshape(-1),
+                               (1.0 / raw[f"{base}.gate_proj.weight_global_scale"]).to(torch.float16).reshape(-1))
+
+
+def test_dense_scale_on_an_unquantized_module_is_rejected(tmp_path):
+    """A checkpoint that stores a scale for a module the config leaves bf16 is inconsistent."""
+    gdn = f"{LM}.layers.0.linear_attn"
+    save_file({f"{gdn}.in_proj_a.weight_scale": torch.rand(VH, 1, dtype=torch.bfloat16)},
+              str(tmp_path / "model.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(_config_json(CT_DENSE_QUANT)))
+    with pytest.raises(ValueError, match="in_proj_ba.*no per-channel scale"):
+        _load(str(tmp_path))
 
 
 ATTN = f"{LM}.layers.1.self_attn"
