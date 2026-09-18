@@ -67,8 +67,8 @@ def validate_mtp_config(config):
     if model_type == "qwen4_exp":
         if config.moe_cpu_layers:
             raise ValueError("Experimental Qwen MTP does not support CPU expert layers")
-        if config.moe_backend not in ("offload", "hybrid", "auto"):
-            raise ValueError("Experimental Qwen MTP requires --moe-backend offload|hybrid|auto")
+        if config.moe_strategy not in ("offload", "hybrid", "auto"):
+            raise ValueError("Experimental Qwen MTP requires --moe-strategy offload|hybrid|auto")
         k = int(getattr(config, "experimental_mtp_tokens", 1) or 1)
         if k < 1 or k > 8:
             raise ValueError("Experimental Qwen MTP requires --experimental-mtp-tokens in 1..8")
@@ -80,7 +80,7 @@ def validate_mtp_config(config):
             "Experimental GLM MTP requires --cache-type naive --cuda-graph-max-bs 0 "
             "and FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1"
         )
-    if config.moe_backend != "offload" or config.moe_cpu_layers:
+    if config.moe_strategy != "offload" or config.moe_cpu_layers:
         raise ValueError("Experimental GLM MTP currently requires GPU expert offload without CPU layers")
     if int(getattr(config, "experimental_mtp_tokens", 1) or 1) != 1:
         raise ValueError("Experimental GLM MTP only supports one draft token")
@@ -88,6 +88,7 @@ def validate_mtp_config(config):
 
 def load_mtp(config, device):
     from freetoken.models.glm_moe_dsa.weight import _ShardReader
+    from freetoken.models.register import get_model_spec
 
     path = Path(config.model_path)
     index = path / "model.safetensors.index.json"
@@ -108,11 +109,13 @@ def load_mtp(config, device):
         if text.get("num_nextn_predict_layers") != 1 or model_config.num_layers != text["num_hidden_layers"]:
             raise ValueError("GLM MTP requires one draft layer and the complete target stack")
         cls = Glm5NextMTP
+    # the draft head reuses the target layer class, so it merges the same packed parts the target's dense reader does
+    packed = get_model_spec(hf["architectures"][0]).packed_modules_mapping
     with torch.device("meta"), torch_dtype(config.dtype):
         head = cls(model_config)
     reader = _ShardReader(str(path), json.loads(index.read_text())["weight_map"], torch.device("cpu"))
     try:
-        head.load(reader, device)
+        head.load(reader, device, packed)
     finally:
         reader.close()
     logger.info_rank0("Loaded checkpoint MTP head with independent resident draft experts")

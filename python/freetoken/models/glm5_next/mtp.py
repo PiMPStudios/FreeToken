@@ -44,7 +44,7 @@ class _SharedHead(BaseOP):
 
 class Glm5NextMTP(BaseOP):
     def __init__(self, config):
-        config = replace(config, attn_quant="none", dense_quant="none", moe_backend="fused")
+        config = replace(config, attn_quant="none", dense_quant="none", moe_strategy="fused")
         self._config = config
         d, eps = config.hidden_size, config.rms_norm_eps
         self.enorm = RMSNorm(d, eps=eps)
@@ -53,7 +53,7 @@ class Glm5NextMTP(BaseOP):
         self.input_layernorm = RMSNorm(d, eps=eps)
         self.post_attention_layernorm = RMSNorm(d, eps=eps)
         self.self_attn = Glm5NextAttention(config, config.num_layers)
-        self.mlp = Glm5NextSparseBlock(replace(config, moe_backend="offload"), config.num_layers)
+        self.mlp = Glm5NextSparseBlock(replace(config, moe_strategy="offload"), config.num_layers)
         self.mlp.experts = _DraftExperts(config)
         self.shared_head = _SharedHead(config)
 
@@ -66,7 +66,8 @@ class Glm5NextMTP(BaseOP):
         h = h + self.mlp.forward(self.post_attention_layernorm.forward(h))
         return self.shared_head.norm.forward(h)
 
-    def load(self, reader, device):
+    def load(self, reader, device, packed=None):
+        """The GLM draft head keeps the checkpoint's layer layout as-is, so the packed mapping is unused here."""
         config = self._config
         layer = config.num_layers
         prefix = f"model.language_model.layers.{layer}."

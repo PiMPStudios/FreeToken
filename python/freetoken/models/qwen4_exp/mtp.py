@@ -9,7 +9,7 @@ from freetoken.moe.fused import fused_topk
 
 from .hc import GatedResidual
 from .model import Qwen4ExpDecoderLayer
-from .weight import _try_fuse
+from .weight import _DenseFuser
 
 
 class _DraftExperts(MoELayer):
@@ -29,7 +29,7 @@ class Qwen4ExpMTP(BaseOP):
         self.fc_hidden = LinearReplicated(d, d, has_bias=False)
         self.pre_fc_norm_embedding = GemmaPlusOneRMSNorm(d, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = GemmaPlusOneRMSNorm(d * n, eps=config.rms_norm_eps)
-        draft_config = replace(config, expert_quant="none", moe_backend="fused")
+        draft_config = replace(config, expert_quant="none", moe_strategy="fused")
         layer = Qwen4ExpDecoderLayer(draft_config, config.num_layers)
         layer.mlp.experts = _DraftExperts(
             num_experts=config.num_experts,
@@ -51,18 +51,22 @@ class Qwen4ExpMTP(BaseOP):
         self.last_multi = h
         return self.hyper_connection_mixer.mix(h)[0]
 
-    def load(self, reader, device):
-        state, pending = {}, {}
+    def load(self, reader, device, packed):
+        from freetoken.layers.quantization import get_quant_config
+
+        # The draft layer reuses the target's layer class, so it merges the same packed parts the target's dense reader does; the QuantConfig picks the GDN in_proj layout.
+        fuser = _DenseFuser(get_quant_config(), packed)
+        state: dict[str, torch.Tensor] = {}
         for raw in reader._weight_map:
             if not raw.startswith("mtp."):
                 continue
             name = raw.removeprefix("mtp.")
             tensor = reader.get(raw).to(device)
-            fused = _try_fuse(name, tensor, pending)
+            fused = fuser.fuse(name, tensor)
             if fused is None:
-                state[name] = tensor
-            elif fused:
-                state[fused[0]] = fused[1]
-        if pending:
-            raise ValueError(f"Incomplete MTP projections: {sorted(pending)}")
+                state[name] = fuser.check_unfused(name, tensor)
+            else:
+                state.update(fused)
+        if fuser.buf:
+            raise ValueError(f"Incomplete MTP projections: {sorted(k[0] + '.' + k[1] for k in fuser.buf)}")
         self.load_state_dict(state)

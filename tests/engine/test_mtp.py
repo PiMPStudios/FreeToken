@@ -224,7 +224,7 @@ def test_chunked_prompt_pairs_previous_hidden_with_actual_next_token(monkeypatch
 @pytest.mark.parametrize("field,value", [
     ("max_running_req", 2), ("cache_type", "radix"),
     ("cuda_graph_max_bs", 1), ("cuda_graph_bs", [1]),
-    ("moe_backend", "hybrid"), ("moe_cpu_layers", "1"),
+    ("moe_strategy", "hybrid"), ("moe_cpu_layers", "1"),
 ])
 def test_unsupported_runtime_modes_fail_before_loading(monkeypatch, field, value):
     import freetoken.env
@@ -232,7 +232,7 @@ def test_unsupported_runtime_modes_fail_before_loading(monkeypatch, field, value
     monkeypatch.setattr(freetoken.env, "ENV", SimpleNamespace(DISABLE_OVERLAP_SCHEDULING=True))
     config = SimpleNamespace(max_running_req=1, tp_info=SimpleNamespace(size=1),
                              cache_type="naive", cuda_graph_max_bs=0, cuda_graph_bs=None,
-                             moe_backend="offload", moe_cpu_layers=None, use_dummy_weight=False)
+                             moe_strategy="offload", moe_cpu_layers=None, use_dummy_weight=False)
     validate_mtp_config(config)
     setattr(config, field, value)
     with pytest.raises(ValueError, match="Experimental"):
@@ -246,7 +246,7 @@ def test_qwen_allows_radix_graphs_and_hybrid(monkeypatch):
     config = SimpleNamespace(
         max_running_req=1, tp_info=SimpleNamespace(size=1),
         cache_type="radix", cuda_graph_max_bs=1, cuda_graph_bs=None,
-        moe_backend="hybrid", moe_cpu_layers=None, use_dummy_weight=False,
+        moe_strategy="hybrid", moe_cpu_layers=None, use_dummy_weight=False,
         model_config=SimpleNamespace(model_type="qwen4_exp"),
     )
     validate_mtp_config(config)

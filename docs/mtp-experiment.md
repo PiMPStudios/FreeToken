@@ -71,7 +71,7 @@ host history so both verification positions fetch their correct embedding rows.
   presets will not use MTP.
 - `--cache-type naive --cuda-graph-max-bs 0` and
   `FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1`.
-- `--moe-backend offload`, without CPU expert layers.
+- `--moe-strategy offload`, without CPU expert layers.
 - One draft token per verification; only the checkpoint layouts above have been
   audited. FTW and dummy-weight loading are not supported by this experiment.
 
@@ -89,7 +89,7 @@ FREETOKEN_GLM5_ATTN_FP8=1 FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 \
 bash scripts/mtp-env.sh .venv/bin/ft serve \
   --model /home/tweaver/models/llm/GLM-5.3-Flash-NVFP4 \
   --host 127.0.0.1 --port 18090 --served-model-name mtp-test \
-  --moe-backend offload --nvfp4-backend auto --memory-ratio 0.90 \
+  --moe-strategy offload --nvfp4-backend auto --memory-ratio 0.90 \
   --kv-reserve-tokens 8192 --max-seq-len-override 8192 \
   --max-prefill-length 64 \
   --max-running-requests 1 --cuda-graph-max-bs 0 --cache-type naive \
@@ -103,7 +103,7 @@ FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1 \
 bash scripts/mtp-env.sh .venv/bin/ft serve \
   --model /home/tweaver/models/llm/Qwen3.8-Flash-Next-NVFP4 \
   --host 127.0.0.1 --port 18090 --served-model-name mtp-test \
-  --moe-backend offload --nvfp4-backend auto --ple-backend disk \
+  --moe-strategy offload --nvfp4-backend auto --ple-backend disk \
   --memory-ratio 0.90 --kv-reserve-tokens 8192 \
   --max-seq-len-override 8192 --max-prefill-length 64 \
   --max-running-requests 1 --cuda-graph-max-bs 0 --cache-type naive \
