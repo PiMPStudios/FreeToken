@@ -2,7 +2,7 @@ import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
-from freetoken.core import get_global_ctx
+from freetoken.core import get_global_ctx, try_get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
@@ -276,7 +276,9 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
-        acc = getattr(get_global_ctx().batch, "mtp_expert_uniques", None)
+        # MTP verification counts this step's unique routed experts (fetch profiling); plain steps have no such list on the batch, and no context at all outside an engine step
+        ctx = try_get_global_ctx()
+        acc = getattr(ctx.batch, "mtp_expert_uniques", None) if ctx is not None else None
         if acc is not None:
             acc.append(int(torch.unique(topk_ids).numel()))
         if cache.is_cpu_layer(self.layer_id):

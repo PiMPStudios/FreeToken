@@ -369,7 +369,7 @@ class MTPDecoder:
         self._flush_phases()
         req = batch.reqs[0]
         sp = req.sampling_params
-        if req.aborted or not sp.is_greedy or req.mm_embeds is not None:
+        if req.aborted or not sp.is_greedy or req.mm_items:
             self.reset()
             return None
         if req.uid != self.uid or (batch.is_decode and req.device_len != self.expected_len):

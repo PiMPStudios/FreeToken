@@ -224,7 +224,7 @@ def test_factory_maps_speculative_layer_after_target_stack():
 
     spec = _spec(layer_ids=(1, 3, 5, 7, 8), num_index_layers=5)
     mc = SimpleNamespace(
-        num_layers=8, has_swa_attention=False, has_linear_attention=True,
+        num_layers=8, has_swa_attention=False, has_linear_attention=True, model_is_mrope=False,
         num_kv_heads=2, head_dim=64, dsv4_args=None,
     )
     mc.kv_cache_group_specs = lambda: (spec,)

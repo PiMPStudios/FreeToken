@@ -27,10 +27,13 @@ class _DraftExperts(MoELayer):
             fused_experts_decode_fp8_blockscale,
         )
 
+        limit = self._limit
         return fused_experts_decode_fp8_blockscale(
             hidden_states, self.gate_up_proj, self.gate_up_scale_inv,
             self.down_proj, self.down_scale_inv, topk_weights, topk_ids,
-            swiglu_limit=self._limit,
+            activation="swiglu_clamp" if limit is not None else "silu",
+            act_alpha=1.0,
+            act_limit=float("inf") if limit is None else limit,
         )
 
 

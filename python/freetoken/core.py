@@ -224,3 +224,8 @@ def set_global_ctx(ctx: Context):
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
     return _GLOBAL_CTX
+
+
+def try_get_global_ctx() -> Context | None:
+    """The global context, or ``None`` outside an engine step (unit tests, off-engine kernels)."""
+    return _GLOBAL_CTX
