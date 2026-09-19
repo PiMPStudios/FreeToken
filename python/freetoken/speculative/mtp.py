@@ -254,6 +254,10 @@ class MTPDecoder:
         b.padded_reqs = b.reqs
         b.input_ids = tokens.to(torch.int32)
         b.positions = torch.arange(start, r.device_len, dtype=torch.int32, device=tokens.device)
+        # mrope models feed [3, n] positions; a text-only verify step uses the sequence
+        # index on all three t/h/w rows, so broadcast the 1-D positions.
+        if getattr(self.engine.config.model_config, "model_is_mrope", False):
+            b.mrope_positions = b.positions.unsqueeze(0).expand(3, -1).contiguous()
         b.out_loc = self.engine.page_table[req.table_idx, start:r.device_len].clone()
         b.speculative_verify = verify
         slot = self._gdn_slot(req)

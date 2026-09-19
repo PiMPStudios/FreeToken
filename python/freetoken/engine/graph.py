@@ -233,12 +233,18 @@ class GraphRunner:
         batch = Batch([dummy], "prefill")
         batch.padded_reqs = batch.reqs
         batch.speculative_verify = True
-        self.verify_buffer = GraphCaptureBuffer.init(t, vocab_size, self.device)
+        self.verify_buffer = GraphCaptureBuffer.init(
+            t, vocab_size, self.device, mrope=self.mrope
+        )
         buf = self.verify_buffer
         buf.input_ids.zero_()
         buf.positions.copy_(
             torch.arange(1, 1 + t, dtype=torch.int32, device=self.device)
         )
+        # mrope models feed [3, n] positions; for text-only verify all three t/h/w rows
+        # equal the sequence index (the captured values are placeholders, replay overwrites).
+        if buf.mrope_positions is not None:
+            buf.mrope_positions.copy_(buf.positions.unsqueeze(0).expand(3, -1))
         dummy_slot = int(get_global_ctx().page_table[dummy.table_idx, 0].item())
         buf.out_loc.fill_(dummy_slot)
         slot = (
@@ -248,6 +254,8 @@ class GraphRunner:
         batch.input_ids = buf.input_ids
         batch.out_loc = buf.out_loc
         batch.positions = buf.positions
+        if buf.mrope_positions is not None:
+            batch.mrope_positions = buf.mrope_positions
         batch.linear_table_idx = buf.table_idx[:1]
         batch.active_table_idx = torch.tensor(
             [dummy.table_idx], dtype=torch.int64, device=self.device
@@ -283,11 +291,15 @@ class GraphRunner:
         buf.input_ids.copy_(batch.input_ids)
         buf.out_loc.copy_(batch.out_loc)
         buf.positions.copy_(batch.positions)
+        if buf.mrope_positions is not None:
+            buf.mrope_positions.copy_(batch.mrope_positions)
         if batch.linear_table_idx is not None:
             buf.table_idx[:1].copy_(batch.linear_table_idx.reshape(-1)[:1])
         batch.input_ids = buf.input_ids
         batch.out_loc = buf.out_loc
         batch.positions = buf.positions
+        if buf.mrope_positions is not None:
+            batch.mrope_positions = buf.mrope_positions
         batch.linear_table_idx = buf.table_idx[:1]
         batch.fla_metadata = self._verify_fla
         self.attn_backend.prepare_for_replay(batch)
