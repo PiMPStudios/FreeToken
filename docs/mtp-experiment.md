@@ -80,6 +80,20 @@ two-token verification also takes a different floating-point path from two
 single-token target calls. The mode is deterministic, but a near-tied greedy
 decision can therefore differ from the unchanged eager server.
 
+## When MTP is a net loss
+
+MTP earns its keep when the target's experts are resident on the GPU, because
+the extra verify forward is mostly compute. Under `--moe-strategy offload` or
+`hybrid` the experts live in system memory and are fetched over PCIe on
+demand, so the (k+1)-token verify step transfers several times the expert
+data of a single-token decode. On the NVFP4 checkpoint measured here that
+extra PCIe cost outweighs the draft's savings even at a ~0.68 acceptance
+rate: the phase profile showed the verify step taking most of each round, and
+single-stream MTP decode ran well below ordinary decoding.
+
+In the PCIe-bound regime, leave `--experimental-mtp` off; the flag helps only
+when the experts fit on the GPU and the workload is compute-bound.
+
 ## Commands
 
 GLM candidate:
