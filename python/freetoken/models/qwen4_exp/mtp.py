@@ -29,7 +29,11 @@ class Qwen4ExpMTP(BaseOP):
         self.fc_hidden = LinearReplicated(d, d, has_bias=False)
         self.pre_fc_norm_embedding = GemmaPlusOneRMSNorm(d, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = GemmaPlusOneRMSNorm(d * n, eps=config.rms_norm_eps)
-        draft_config = replace(config, expert_quant="none", moe_strategy="fused")
+        # The draft head is fully BF16: the checkpoint's quantized experts are swapped for
+        # independent BF16 draft experts and the qwen dense projections are BF16. Build the
+        # draft layer unquantized (quant=None) so make_moe_layer does not pick the
+        # checkpoint's NVFP4 expert kernel, which is unusable for a resident (fused) layer.
+        draft_config = replace(config, expert_quant="none", moe_strategy="fused", quant=None)
         layer = Qwen4ExpDecoderLayer(draft_config, config.num_layers)
         layer.mlp.experts = _DraftExperts(
             num_experts=config.num_experts,
@@ -39,7 +43,9 @@ class Qwen4ExpMTP(BaseOP):
             renormalize=config.norm_topk_prob,
         )
         self.layers = OPList([layer])
-        self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
+        # Build the HC mixer from the same unquantized config so its input_mix_weight_*
+        # modules stay BF16, matching the checkpoint's BF16 MTP tensors.
+        self.hyper_connection_mixer = GatedResidual(draft_config, use_combine=False)
 
     def forward(self, hidden, embedding, batch):
         token = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(embedding))
